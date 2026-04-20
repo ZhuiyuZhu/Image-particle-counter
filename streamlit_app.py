@@ -1,6 +1,6 @@
 """
-荧光颗粒检测器 v3.3 (Streamlit Web版)
-功能完全对应桌面版，支持批量上传、在线预览、CSV导出
+荧光颗粒检测器 v3.4 (Streamlit Web版 - 内存优化)
+修复：use_container_width弃用警告、内存溢出、大图自适应
 """
 
 import streamlit as st
@@ -11,38 +11,39 @@ from skimage.feature import blob_log, peak_local_max
 import pandas as pd
 from PIL import Image, ImageDraw
 import io
+import gc
 from datetime import datetime
 
 # ==================== 页面配置 ====================
 st.set_page_config(
-    page_title="荧光颗粒检测器 v3.3",
+    page_title="荧光颗粒检测器 v3.4",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
+# ==================== 全局内存限制 ====================
+MAX_IMAGE_SIZE = 2048  # 限制最大边长，防止OOM
+
 # ==================== 核心函数 ====================
 def load_image(file_obj):
-    """兼容文件路径和Streamlit上传的文件对象"""
-    if isinstance(file_obj, str):
-        # 本地路径模式（保留原逻辑）
-        image_path = os.path.normpath(file_obj)
-        with open(image_path, 'rb') as f:
-            file_bytes = np.frombuffer(f.read(), dtype=np.uint8)
-    else:
-        # Streamlit UploadedFile 对象
+    """加载图片，支持中文路径和TIF，带内存优化"""
+    if hasattr(file_obj, 'read'):
         file_bytes = np.frombuffer(file_obj.read(), dtype=np.uint8)
+    else:
+        with open(file_obj, 'rb') as f:
+            file_bytes = np.frombuffer(f.read(), dtype=np.uint8)
     
     img = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
     
     if img is None:
-        raise ValueError("无法解码图片，可能格式不支持或文件损坏")
+        raise ValueError("无法解码图片，格式不支持或文件损坏")
     
-    # 位深度转换（保留原逻辑）
+    # 内存优化的位深度转换（避免float64中间数组）
     if img.dtype == np.uint16:
-        img = (img / 256).astype(np.uint8)
+        img = (img >> 8).astype(np.uint8)  # 位运算，零额外内存开销
     elif img.dtype == np.uint32:
-        img = (img / 16777216).astype(np.uint8)
+        img = (img >> 24).astype(np.uint8)
     
     # 统一为3通道BGR
     if len(img.shape) == 2:
@@ -50,19 +51,28 @@ def load_image(file_obj):
     elif img.shape[2] == 4:
         img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
     
+    # 内存保护：限制超大图尺寸
+    h, w = img.shape[:2]
+    max_dim = max(h, w)
+    if max_dim > MAX_IMAGE_SIZE:
+        scale = MAX_IMAGE_SIZE / max_dim
+        new_w, new_h = int(w * scale), int(h * scale)
+        img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        st.warning(f"图片过大，已自动缩放至 {new_w}×{new_h} 以节省内存", icon="⚠️")
+    
     return img
 
 def detect_particles(img_bgr, params):
-    """核心检测逻辑（从原DetectionWorker提取）"""
+    """核心检测逻辑 - 内存优化版"""
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     
     channel_map = {'红色': 0, '绿色': 1, '蓝色': 2}
     ch_idx = channel_map.get(params['color'], 0)
     
     if len(img_rgb.shape) == 3 and img_rgb.shape[2] >= 3:
-        channel = img_rgb[:, :, ch_idx].astype(float)
+        channel = img_rgb[:, :, ch_idx].astype(np.float32)  # float32足够，省一半内存
     else:
-        channel = img_rgb.astype(float)
+        channel = img_rgb.astype(np.float32)
     
     # 根据模式设置参数
     if params['mode'] == '高精度':
@@ -80,14 +90,14 @@ def detect_particles(img_bgr, params):
     
     results = {'img_rgb': img_rgb}
     
-    # LoG检测
+    # LoG检测 - num_sigma从10降到5，大幅减少内存占用
     if params['use_log']:
         red_norm = (channel - channel.min()) / (channel.max() - channel.min() + 1e-8)
         blobs = blob_log(
             red_norm,
             min_sigma=min_sigma,
             max_sigma=max_sigma,
-            num_sigma=10,
+            num_sigma=5,  # 原为10，内存优化关键
             threshold=log_threshold,
             overlap=0.3 if params['uniform_size'] else 0.5
         )
@@ -97,6 +107,7 @@ def detect_particles(img_bgr, params):
             'count': len(blobs),
             'blobs': blobs,
         }
+        del red_norm  # 立即释放大数组
     
     # 局部最大值检测
     if params['use_local']:
@@ -114,11 +125,13 @@ def detect_particles(img_bgr, params):
             'count': len(coords),
             'coords': coords,
         }
+        del bg, red_clean, red_norm2  # 立即释放
     
+    del channel  # 释放通道数组
     return results
 
 def draw_results(results, params):
-    """绘制检测结果，返回PIL图像列表"""
+    """绘制检测结果，返回PIL图像"""
     img_rgb = results['img_rgb']
     images = []
     captions = []
@@ -128,61 +141,33 @@ def draw_results(results, params):
     captions.append(f"原始图像 ({img_rgb.shape[1]}×{img_rgb.shape[0]})")
     
     # LoG结果
-    if params['use_log'] and 'log' in results:
+    if params['use_log'] and 'log' in results and len(results['log']['blobs']) > 0:
         img_log = Image.fromarray(img_rgb.copy())
         draw = ImageDraw.Draw(img_log)
         for y, x, r in results['log']['blobs']:
-            # 绿色圆圈
-            draw.ellipse(
-                [x - r, y - r, x + r, y + r],
-                outline=(0, 255, 0), width=2
-            )
-            # 蓝色中心点
-            draw.ellipse(
-                [x - 2, y - 2, x + 2, y + 2],
-                fill=(255, 0, 0)
-            )
+            draw.ellipse([x-r, y-r, x+r, y+r], outline=(0, 255, 0), width=2)
+            draw.ellipse([x-2, y-2, x+2, y+2], fill=(255, 0, 0))
         images.append(img_log)
         captions.append(f"LoG: {results['log']['count']} 个颗粒")
     else:
         images.append(None)
-        captions.append("LoG: 未启用")
+        captions.append("LoG: 未启用/无结果")
     
     # 局部最大值结果
-    if params['use_local'] and 'local' in results:
+    if params['use_local'] and 'local' in results and len(results['local']['coords']) > 0:
         img_local = Image.fromarray(img_rgb.copy())
         draw = ImageDraw.Draw(img_local)
         coords = results['local']['coords']
         for y, x in coords:
-            # 绿色填充圆
-            draw.ellipse([x - 5, y - 5, x + 5, y + 5], fill=(0, 255, 0))
-            # 白色外圈
-            draw.ellipse([x - 7, y - 7, x + 7, y + 7], outline=(255, 255, 255), width=2)
+            draw.ellipse([x-5, y-5, x+5, y+5], fill=(0, 255, 0))
+            draw.ellipse([x-7, y-7, x+7, y+7], outline=(255, 255, 255), width=2)
         images.append(img_local)
         captions.append(f"局部最大值: {results['local']['count']} 个颗粒")
     else:
         images.append(None)
-        captions.append("局部最大值: 未启用")
+        captions.append("局部最大值: 未启用/无结果")
     
     return images, captions
-
-def create_downloadable_figure(images, captions):
-    """将三张图拼接为一张用于下载"""
-    valid_images = [img for img in images if img is not None]
-    if not valid_images:
-        return None
-    
-    widths, heights = zip(*(i.size for i in valid_images))
-    total_width = sum(widths)
-    max_height = max(heights)
-    
-    combined = Image.new('RGB', (total_width, max_height), (255, 255, 255))
-    x_offset = 0
-    for img in valid_images:
-        combined.paste(img, (x_offset, 0))
-        x_offset += img.width
-    
-    return combined
 
 def build_csv_data(results):
     """构建CSV数据"""
@@ -209,7 +194,7 @@ def build_csv_data(results):
 
 # ==================== Streamlit UI ====================
 st.sidebar.title("🔬 荧光颗粒检测器")
-st.sidebar.caption("v3.3 Web版 | 支持中文路径和TIF格式")
+st.sidebar.caption("v3.4 Web版 | 内存优化 | 支持中文路径和TIF")
 
 # ---- 参数设置 ----
 st.sidebar.markdown("### 检测参数")
@@ -226,9 +211,9 @@ uniform_size = st.sidebar.checkbox("颗粒大小均匀", value=False,
 
 st.sidebar.markdown("### 检测方法")
 use_log = st.sidebar.checkbox("LoG斑点检测", value=True, 
-                              help="提供颗粒半径信息")
+                              help="提供颗粒半径信息（较耗内存）")
 use_local = st.sidebar.checkbox("局部最大值检测", value=True, 
-                                help="速度更快")
+                                help="速度更快，内存友好")
 
 if not use_log and not use_local:
     st.sidebar.error("请至少选择一种检测方法！")
@@ -241,8 +226,10 @@ params = {
     'use_local': use_local
 }
 
-# ---- 文件上传 ----
 st.sidebar.markdown("---")
+st.sidebar.info(f"内存保护：单图最大边长限制为 {MAX_IMAGE_SIZE}px")
+
+# ---- 文件上传 ----
 uploaded_files = st.sidebar.file_uploader(
     "上传图片（支持批量）",
     type=['png', 'jpg', 'jpeg', 'tif', 'tiff', 'bmp', 'gif'],
@@ -253,10 +240,10 @@ uploaded_files = st.sidebar.file_uploader(
 st.title("荧光颗粒检测结果")
 
 if not uploaded_files:
-    st.info("👈 请在左侧上传图片开始检测（支持拖拽）")
+    st.info("👈 请在左侧上传图片开始检测（支持拖拽多选）")
     st.stop()
 
-# 批量处理进度
+# 批量处理
 progress_bar = st.progress(0)
 status_text = st.empty()
 
@@ -280,7 +267,8 @@ for idx, uploaded_file in enumerate(uploaded_files):
         for col, img, cap in zip(cols, images, captions):
             with col:
                 if img is not None:
-                    st.image(img, caption=cap, use_container_width=True)
+                    # 关键修复：use_container_width -> width
+                    st.image(img, caption=cap, width="stretch")
                 else:
                     st.info(cap)
         
@@ -297,14 +285,23 @@ for idx, uploaded_file in enumerate(uploaded_files):
         
         st.markdown(" | ".join(stats), unsafe_allow_html=True)
         
-        # 下载按钮区域
+        # 下载按钮
         dcol1, dcol2 = st.columns(2)
         
-        # 下载结果图
-        combined_img = create_downloadable_figure(images, captions)
-        if combined_img is not None:
+        # 下载结果图（拼接三图为一张）
+        valid_images = [img for img in images if img is not None]
+        if valid_images:
+            widths, heights = zip(*(i.size for i in valid_images))
+            total_width = sum(widths)
+            max_height = max(heights)
+            combined = Image.new('RGB', (total_width, max_height), (255, 255, 255))
+            x_offset = 0
+            for img in valid_images:
+                combined.paste(img, (x_offset, 0))
+                x_offset += img.width
+            
             buf = io.BytesIO()
-            combined_img.save(buf, format='PNG')
+            combined.save(buf, format='PNG')
             dcol1.download_button(
                 label="💾 保存结果图",
                 data=buf.getvalue(),
@@ -337,6 +334,10 @@ for idx, uploaded_file in enumerate(uploaded_files):
         
         st.markdown("---")
         
+        # ===== 内存优化关键：处理完立即释放大对象 =====
+        del img_bgr, results, images, valid_images, combined
+        gc.collect()
+        
     except Exception as e:
         st.error(f"处理 {uploaded_file.name} 时出错: {str(e)}")
     
@@ -345,7 +346,7 @@ for idx, uploaded_file in enumerate(uploaded_files):
 status_text.empty()
 progress_bar.empty()
 
-# 批量汇总导出
+# 批量汇总
 if len(all_summaries) > 1:
     st.sidebar.markdown("---")
     st.sidebar.subheader("批量汇总")
@@ -358,7 +359,7 @@ if len(all_summaries) > 1:
         file_name=f"batch_summary_{datetime.now().strftime('%H%M%S')}.csv",
         mime="text/csv"
     )
-    st.sidebar.dataframe(summary_df, use_container_width=True)
+    st.sidebar.dataframe(summary_df, use_container_width=False)  # sidebar窄，不用stretch
 
 st.sidebar.markdown("---")
 st.sidebar.success("检测完成！")
